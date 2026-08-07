@@ -96,7 +96,9 @@ test('3名を登録して編成保存し、バックアップを書き出せる'
 
   await page.goto('/settings')
   page.once('dialog', (dialog) => dialog.accept())
+  const resetReload = page.waitForEvent('load')
   await page.getByRole('button', { name: 'ローカルデータを初期化' }).click()
+  await resetReload
   await expect(page.getByRole('heading', { name: '設定', exact: true })).toBeVisible()
 
   await page.goto('/backup')
