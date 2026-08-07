@@ -1,0 +1,924 @@
+"""
+Nobunaga Shinsen Hero Crawler - 2-Stage
+
+Stage 1: Crawl hero list page → index file with basic info + detail URLs
+Stage 2: Crawl each hero detail page → stats, traits, skill info
+
+Outputs:
+    data/heroes_crawled.yaml  — hero data (skills as name references only)
+    data/skills_crawled.yaml  — skill details (type, rarity, target, rate, description)
+    data/skills.yaml          — canonical skills (raw section updated)
+    data/traits.yaml          — canonical traits (raw section updated)
+
+Usage:
+    python script/crawl_heroes.py [options]
+
+Examples:
+    python script/crawl_heroes.py                          # index only
+    python script/crawl_heroes.py --detail                 # index + all detail pages
+    python script/crawl_heroes.py --detail --limit 30      # first 30
+    python script/crawl_heroes.py --detail --name 信長      # filter by name
+    python script/crawl_heroes.py --refresh-index --detail  # re-fetch index, keep detail cache
+    python script/crawl_heroes.py --force --detail          # ignore all cache
+"""
+
+import argparse
+import json
+import random
+import re
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+import requests
+import yaml
+from bs4 import BeautifulSoup
+from tqdm import tqdm
+
+from paths import (
+    CRAWL_CACHE_DIR,
+    HEROES_CRAWLED, SKILLS_CRAWLED, ASSEMBLY_CRAWLED, BINGXUE_CRAWLED,
+    SKILLS_CANONICAL, TRAITS_CANONICAL, BINGXUE_CANONICAL,
+)
+
+# Active cache dir. Index caches are per-URL files inside it.
+_cache_dir = CRAWL_CACHE_DIR
+
+# Hero index sources, in priority order. First = primary (武将一覧: all tiers +
+# ★-based rarity). The rest are supplementary ranking pages that contribute
+# only net-new heroes (see extract_ranking_list). Merged/deduped by detail id.
+DEFAULT_INDEX_URLS = [
+    "https://game8.jp/nobunaga-shinsen/737773",  # 武将一覧 (primary)
+    "https://game8.jp/nobunaga-shinsen/737771",  # 最強武将ランキング (supplementary, 5★-only)
+]
+DEFAULT_INDEX_URL = DEFAULT_INDEX_URLS[0]  # kept for back-compat
+DEFAULT_TIMEOUT = 15
+
+# JP skill type → normalized key
+SKILL_TYPE_MAP = {
+    "受動": "被動",
+    "能動": "主動",
+    "指揮": "指揮",
+    "突撃": "突擊",
+    "陣法": "陣法",
+    "兵種": "兵種",
+}
+
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+
+def validate_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Invalid scheme: {parsed.scheme}")
+    if "game8.jp" not in parsed.netloc:
+        raise ValueError(f"Unexpected host: {parsed.netloc}, expected game8.jp")
+    if "nobunaga-shinsen" not in parsed.path:
+        raise ValueError(f"Path missing 'nobunaga-shinsen': {parsed.path}")
+    return url
+
+
+def fetch_page(url: str, timeout: float = DEFAULT_TIMEOUT) -> tuple[BeautifulSoup, str]:
+    """Returns (soup, raw_html). Raw HTML needed because html.parser strips
+    <template> contents — 兵学 effect extraction re-parses those via regex."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja,zh-TW;q=0.9,zh;q=0.8,en;q=0.7",
+    }
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return BeautifulSoup(resp.text, "html.parser"), resp.text
+
+
+def crawl_delay():
+    time.sleep(random.random() * 0.5 + 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+
+def _detail_cache_path(url: str) -> Path:
+    slug = urlparse(url).path.strip("/").replace("/", "_")
+    return _cache_dir / f"{slug}.json"
+
+
+def load_detail_cache(url: str) -> dict | None:
+    path = _detail_cache_path(url)
+    if path.exists():
+        return json.loads(path.read_text("utf-8"))
+    return None
+
+
+def save_detail_cache(url: str, data: dict):
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+    path = _detail_cache_path(url)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+
+
+def _index_cache_path(url: str) -> Path:
+    slug = urlparse(url).path.strip("/").replace("/", "_")
+    return _cache_dir / f"_index_{slug}.json"
+
+
+def load_index(url: str) -> list[dict] | None:
+    path = _index_cache_path(url)
+    if path.exists():
+        return json.loads(path.read_text("utf-8"))
+    return None
+
+
+def save_index(url: str, heroes: list[dict]):
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+    _index_cache_path(url).write_text(json.dumps(heroes, ensure_ascii=False, indent=2), "utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: List page → index
+# ---------------------------------------------------------------------------
+
+def extract_hero_list(soup: BeautifulSoup, base_url: str) -> list[dict]:
+    """Extract heroes from list page.
+
+    Page has two table formats:
+      - 13-td rows: structured cells at td[8]-td[12] for stars/cost/faction/clan/gender
+      - 9-td rows: same data in td[4]-td[8] with class='hidden'
+    Both have td[0]=name+portrait, td[1]=bracket fields with 【コスト】.
+    We parse bracket text as the reliable source for all fields.
+    """
+    heroes = []
+
+    for td in soup.find_all("td"):
+        if "【コスト】" not in td.get_text():
+            continue
+        row = td.parent
+        if not row or row.name != "tr":
+            continue
+        cells = row.find_all("td")
+        if len(cells) < 4:
+            continue
+
+        link = cells[0].find("a", href=re.compile(r"/nobunaga-shinsen/\d+"))
+        name = cells[0].get_text(strip=True)
+        if not link or not name:
+            continue
+
+        detail_url = urljoin(base_url, link["href"])
+
+        portrait_img = cells[0].find("img", attrs={"data-src": True})
+        portrait = portrait_img["data-src"] if portrait_img else None
+
+        # Parse all fields from bracket text (works for both table formats)
+        bracket_text = td.get_text(separator=" ")
+        fields = _parse_bracket_fields(bracket_text)
+        skill_names = _parse_bracket_skills(bracket_text)
+
+        # Star count from any cell containing ★
+        rarity = 0
+        for cell in cells:
+            stars = cell.get_text(strip=True).count("★")
+            if stars > 0:
+                rarity = stars
+                break
+
+        heroes.append({
+            "name": name,
+            "detail_url": detail_url,
+            "portrait": portrait,
+            "rarity": rarity or fields.get("rarity", 0),
+            "cost": fields.get("cost", 0),
+            "faction": fields.get("faction", ""),
+            "clan": fields.get("clan", ""),
+            "gender": fields.get("gender", ""),
+            **skill_names,
+        })
+
+    return heroes
+
+
+def _parse_bracket_fields(text: str) -> dict:
+    """Parse structured fields from bracket-delimited text."""
+    data = {}
+    cost_m = re.search(r"【コスト】\s*(\d+)", text)
+    if cost_m:
+        data["cost"] = int(cost_m.group(1))
+    gender_m = re.search(r"【性別】\s*(男|女)", text)
+    if gender_m:
+        data["gender"] = gender_m.group(1)
+    faction_m = re.search(r"【勢力】\s*(.+?)(?=\s*【|$)", text)
+    if faction_m:
+        data["faction"] = faction_m.group(1).strip()
+    clan_m = re.search(r"【家門】\s*(.+?)(?=\s*【|$)", text)
+    if clan_m:
+        data["clan"] = clan_m.group(1).strip()
+    return data
+
+
+def _parse_bracket_skills(text: str) -> dict:
+    data = {}
+    patterns = {
+        "unique_skill":    r"【固有戦法】\s*(.+?)(?=\s*【|$)",
+        "teachable_skill": r"【伝授戦法】\s*(.+?)(?=\s*【|$)",
+        "assembly_skill":  r"【評定衆技能】\s*(.+?)(?=\s*【|$)",
+    }
+    for key, pat in patterns.items():
+        m = re.search(pat, text)
+        if m:
+            val = m.group(1).strip()
+            data[key] = None if val == "なし" else val
+    return data
+
+
+def extract_ranking_list(soup: BeautifulSoup, base_url: str) -> list[dict]:
+    """Extract heroes from a ranking page (最強武将ランキング).
+
+    The bracket-table parser (extract_hero_list) finds nothing here: tier tables
+    are portrait links only, and the おすすめ武将 tables have 3-td rows. Instead
+    we enumerate portrait links directly — a hero's <img> carries the CSS class
+    'img-shadow' and its alt is the hero name; article thumbnails lack that class
+    (their alt is a headline or 'アイコン'). Rarity is hard-set to 5: ranking
+    pages list SR/5★ heroes only and expose no ★ glyphs, and rarity is available
+    nowhere else for the net-new heroes this page contributes.
+    """
+    heroes: dict[str, dict] = {}
+    for a in soup.find_all("a", href=re.compile(r"/nobunaga-shinsen/\d+")):
+        img = a.find("img")
+        if not img or "img-shadow" not in (img.get("class") or []):
+            continue
+        name = (img.get("alt") or "").strip()
+        if not name or name == "アイコン":
+            continue
+        detail_url = urljoin(base_url, a["href"])
+        heroes.setdefault(detail_url, {
+            "name": name,
+            "detail_url": detail_url,
+            "portrait": img.get("data-src") or img.get("src"),
+            "rarity": 5,
+        })
+    return list(heroes.values())
+
+
+def extract_hero_index(soup: BeautifulSoup, base_url: str) -> list[dict]:
+    """Parse a hero index page, auto-detecting its format.
+
+    武将一覧 pages yield bracket-table rows (rich fields); ranking pages yield
+    nothing there, so we fall back to portrait-link enumeration.
+    """
+    heroes = extract_hero_list(soup, base_url)
+    return heroes if heroes else extract_ranking_list(soup, base_url)
+
+
+def _detail_id(url: str) -> str:
+    m = re.search(r"/nobunaga-shinsen/(\d+)", url or "")
+    return m.group(1) if m else (url or "")
+
+
+def merge_index(sources: list[list[dict]]) -> list[dict]:
+    """Union hero lists in priority order (primary first), deduped by detail-page
+    id. The earliest source wins on conflicts; later sources add net-new heroes.
+    """
+    merged: dict[str, dict] = {}
+    for heroes in sources:
+        for h in heroes:
+            merged.setdefault(_detail_id(h.get("detail_url", "")), h)
+    return list(merged.values())
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Detail page
+# ---------------------------------------------------------------------------
+
+STAT_MAP = {
+    "武勇": "val", "知略": "int", "統率": "lea",
+    "速度": "spd", "政務": "pol", "魅力": "cha",
+}
+
+# Detail-page header table: label <th> rows alternate with value <td> rows.
+# Used to backfill cost/faction/clan/gender for ranking-page heroes that the
+# index gave no bracket fields for.
+INDEX_FIELD_MAP = {"コスト": "cost", "性別": "gender", "勢力": "faction", "家門": "clan"}
+
+
+def _extract_index_fields(soup: BeautifulSoup) -> dict:
+    """Pull cost/gender/faction/clan from the detail-page header table.
+
+    Layout: a <th>コスト</th> row of labels is immediately followed by a <td>
+    value row; labels and values align left-to-right (the hero-name <th> is not
+    a known label, so it is skipped). Returns only the fields it finds.
+    """
+    th = next((t for t in soup.find_all("th") if t.get_text(strip=True) == "コスト"), None)
+    table = th.find_parent("table") if th else None
+    if not table:
+        return {}
+
+    rows = table.find_all("tr")
+    fields: dict = {}
+    for i in range(len(rows) - 1):
+        labels = [c.get_text(strip=True) for c in rows[i].find_all("th")
+                  if c.get_text(strip=True) in INDEX_FIELD_MAP]
+        if not labels:
+            continue
+        values = [c.get_text(strip=True) for c in rows[i + 1].find_all("td")]
+        for label, value in zip(labels, values):
+            key = INDEX_FIELD_MAP[label]
+            fields[key] = int(value) if key == "cost" and value.isdigit() else value
+    return fields
+
+
+def extract_hero_detail(soup: BeautifulSoup, html: str, hero_name: str) -> dict:
+    """Returns hero detail dict. Skills stored under 'skills' as raw dicts
+    (will be split into hero ref + skill file later).
+
+    `html` is the raw response text — needed for 兵学 extraction since html.parser
+    drops <template> contents.
+    """
+    detail = {}
+    text = soup.get_text(separator="\n")
+
+    stats = {}
+    for jp, key in STAT_MAP.items():
+        m = re.search(rf"{jp}\s*[:：]?\s*(\d+)", text)
+        if m:
+            stats[key] = int(m.group(1))
+    if stats:
+        detail["stats"] = stats
+
+    traits = _extract_traits(soup)
+    if traits:
+        detail["traits"] = traits
+
+    skills = _extract_skill_details(soup, hero_name)
+    if skills:
+        detail["_raw_skills"] = skills
+        # Override list-page skill names with detail-page names (more accurate)
+        for sk in skills:
+            if sk.get("is_unique"):
+                detail["unique_skill"] = sk["name"]
+            if sk.get("is_teachable"):
+                detail["teachable_skill"] = sk["name"]
+
+    bingxue = _extract_bingxue(html)
+    if bingxue:
+        detail["_raw_bingxue"] = bingxue
+
+    # Backfill index fields (cost/faction/clan/gender) for heroes whose index
+    # page carried none — merged fill-missing in crawl() so list values win.
+    index_fields = _extract_index_fields(soup)
+    if index_fields:
+        detail["_index_fields"] = index_fields
+
+    return detail
+
+
+# ---------------------------------------------------------------------------
+# 兵学 (heigaku) extraction
+# ---------------------------------------------------------------------------
+# Structure per hero detail page (4-5★ only; lower rarities lack the section):
+#   <th colspan=20>兵学</th>
+#   <th>DIR_1</th><th>DIR_2</th>                       ← direction names
+#   <td>major×3 (hr-sep)</td><td>minor×6</td><td>major×3</td><td>minor×6</td>
+#   <th>DIR_3</th><th>DIR_4</th>
+#   <td>...</td><td>...</td><td>...</td>...
+# Each option is a <span class="js-detail-tooltip"> NAME <template> ... EFFECT ... </template> </span>.
+# HTML parsers (html.parser, lxml) mishandle <template>; we regex-extract effects
+# from raw HTML before stripping <template> and walking the structure with BS4.
+
+_TOOLTIP_RE = re.compile(
+    r'<span class="js-detail-tooltip[^"]*"[^>]*>\s*'
+    r'([^<]+?)\s*'
+    r'<template[^>]*>\s*<table[^>]*>\s*<tr>\s*<td[^>]*>'
+    r'(.+?)'
+    r'</td>\s*</tr>\s*</table>\s*</template>',
+    re.DOTALL,
+)
+_TEMPLATE_RE = re.compile(r'<template[^>]*>.*?</template>', re.DOTALL)
+_TAG_RE = re.compile(r'<[^>]+>')
+_WS_RE = re.compile(r'\s+')
+
+
+def _clean_effect(raw: str) -> str:
+    return _WS_RE.sub(" ", _TAG_RE.sub("", raw)).strip()
+
+
+def _extract_bingxue(html: str) -> dict | None:
+    """Returns {direction: {"major": [{name, effect}], "minor": [...]}} or None."""
+    name_to_effect: dict[str, str] = {}
+    for m in _TOOLTIP_RE.finditer(html):
+        name_to_effect[m.group(1).strip()] = _clean_effect(m.group(2))
+
+    cleaned = _TEMPLATE_RE.sub("", html)
+    soup = BeautifulSoup(cleaned, "html.parser")
+
+    heading = next(
+        (th for th in soup.find_all("th") if th.get_text(strip=True) == "兵学"),
+        None,
+    )
+    if heading is None:
+        return None
+    table = heading.find_parent("table")
+    if table is None:
+        return None
+
+    rows = table.find_all("tr")
+    start_idx = next(
+        (i for i, r in enumerate(rows) if heading in r.find_all("th")), None
+    )
+    if start_idx is None:
+        return None
+
+    result: dict[str, dict] = {}
+    i = start_idx + 1
+    while i + 1 < len(rows):
+        dir_ths = rows[i].find_all("th", recursive=False)
+        data_tds = rows[i + 1].find_all("td", recursive=False)
+        # 2 direction headers + 4 data cells per logical row; anything else = end of section
+        if len(dir_ths) != 2 or len(data_tds) != 4:
+            break
+
+        directions = []
+        for th in dir_ths:
+            img = th.find("img")
+            directions.append(img["alt"] if img and img.get("alt") else th.get_text(strip=True))
+
+        for d_idx, direction in enumerate(directions):
+            result[direction] = {
+                "major": _options_from_cell(data_tds[d_idx * 2], name_to_effect),
+                "minor": _options_from_cell(data_tds[d_idx * 2 + 1], name_to_effect),
+            }
+        i += 2
+
+    return result or None
+
+
+def _options_from_cell(cell, name_to_effect: dict[str, str]) -> list[dict]:
+    options = []
+    for span in cell.find_all("span", class_="js-detail-tooltip"):
+        name = span.get_text(" ", strip=True)
+        if not name:
+            continue
+        options.append({"name": name, "effect": name_to_effect.get(name, "")})
+    return options
+
+
+def _extract_traits(soup: BeautifulSoup) -> list[dict]:
+    traits = []
+    for th in soup.find_all("th"):
+        if th.get_text(strip=True) != "特性":
+            continue
+        table = th.find_parent("table")
+        if not table:
+            continue
+
+        in_traits = False
+        for row in table.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            text = row.get_text(strip=True)
+            if len(cells) == 1 and text == "特性":
+                in_traits = True
+                continue
+            if in_traits and len(cells) == 1:
+                break
+            if in_traits and len(cells) == 2:
+                name = cells[0].get_text(strip=True)
+                desc = cells[1].get_text(strip=True)
+                if name and desc:
+                    traits.append({"name": name, "description": desc})
+        break
+    return traits
+
+
+def _parse_skill_description(desc: str, hero_name: str) -> dict:
+    """Parse the bracket-delimited skill description into structured fields."""
+    info: dict = {}
+
+    # Type: first keyword after 【戦法詳細】
+    type_m = re.search(r"【戦法詳細】\s*(受動|能動|指揮|突撃|陣法|兵種)", desc)
+    if type_m:
+        info["type"] = SKILL_TYPE_MAP.get(type_m.group(1), type_m.group(1))
+
+    # Target
+    target_m = re.search(r"【対象種別】(.+?)【", desc)
+    if target_m:
+        info["target"] = target_m.group(1).strip()
+
+    # Activation rate
+    rate_m = re.search(r"【発動確率】(.+?)【", desc)
+    if rate_m:
+        info["activation_rate"] = rate_m.group(1).strip()
+
+    # Aptitude (often empty on game8)
+    apt_m = re.search(r"【適性兵種】([^【]*?)【", desc)
+    if apt_m:
+        apt = apt_m.group(1).strip()
+        if apt:
+            info["aptitude"] = apt
+
+    # Full description text after 【戦法詳細】<type>
+    detail_m = re.search(
+        r"【戦法詳細】\s*(?:受動|能動|指揮|突撃|陣法|兵種)\s*(.+?)(?:【戦法種類】|$)",
+        desc, re.DOTALL,
+    )
+    if detail_m:
+        info["description"] = detail_m.group(1).strip()
+
+    # Commander skill (大将技)
+    commander_m = re.search(r"大将技\s*[：:]\s*(.+?)(?:\n|【|$)", desc)
+    if commander_m:
+        info["commander_bonus"] = commander_m.group(1).strip()
+
+    info["source_hero"] = hero_name
+
+    return info
+
+
+def _extract_skill_details(soup: BeautifulSoup, hero_name: str) -> list[dict]:
+    """Extract skills from h3 headings. Returns list of skill dicts with parsed fields."""
+    skills = []
+    for section_label in ["固有戦法", "伝授戦法"]:
+        h3 = soup.find("h3", string=re.compile(rf"^{section_label}$"))
+        if not h3:
+            continue
+        table = h3.find_next_sibling("table")
+        if not table:
+            continue
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+
+        first_cells = rows[0].find_all(["td", "th"])
+        raw_rarity = first_cells[0].get_text(strip=True) if len(first_cells) > 0 else ""
+        rarity = raw_rarity.replace("戦法", "").replace("戰法", "").strip()  # "S戦法" → "S"
+        name = first_cells[1].get_text(strip=True) if len(first_cells) > 1 else ""
+
+        desc_parts = []
+        for row in rows[1:]:
+            t = row.get_text(strip=True)
+            if t:
+                desc_parts.append(t)
+        raw_desc = "\n".join(desc_parts)
+
+        skill = {"name": name, "rarity": rarity, **_parse_skill_description(raw_desc, hero_name)}
+
+        # Mark if this skill is the hero's unique (fixed) skill or teachable
+        if section_label == "固有戦法":
+            skill["is_unique"] = True
+        else:
+            skill["is_teachable"] = True
+
+        skills.append(skill)
+    return skills
+
+
+# ---------------------------------------------------------------------------
+# Output: split hero YAML + skill YAML
+# ---------------------------------------------------------------------------
+
+def save_outputs(
+    heroes: list[dict],
+    heroes_path: str,
+    skills_path: str,
+    assembly_path: str,
+    bingxue_path: str,
+):
+    """Split crawled data into:
+    - heroes YAML (skill refs only, + per-hero bingxue reference structure)
+    - skills YAML (battle skills: 固有戦法 + 伝授戦法)
+    - assembly skills YAML (評定衆技能 — non-battle / domestic skills)
+    - bingxue YAML (canonical 兵学 option definitions, deduped across heroes)
+    """
+    skills_db: dict[str, dict] = {}
+    assembly_db: dict[str, dict] = {}
+    bingxue_db: dict[str, dict] = {}
+    hero_list = []
+
+    for h in heroes:
+        raw_skills = h.pop("_raw_skills", [])
+        raw_bingxue = h.pop("_raw_bingxue", None)
+
+        for sk in raw_skills:
+            sk_name = sk["name"]
+            if sk_name and sk_name not in skills_db:
+                skills_db[sk_name] = sk
+            elif sk_name in skills_db:
+                if sk.get("is_unique"):
+                    skills_db[sk_name]["is_unique"] = True
+                if sk.get("is_teachable"):
+                    skills_db[sk_name]["is_teachable"] = True
+
+        # Collect assembly skill names (detail comes from future crawler)
+        asm_name = h.get("assembly_skill")
+        if asm_name and asm_name not in assembly_db:
+            assembly_db[asm_name] = {
+                "name": asm_name,
+                "source_heroes": [h["name"]],
+            }
+        elif asm_name and asm_name in assembly_db:
+            assembly_db[asm_name]["source_heroes"].append(h["name"])
+
+        hero_out = {
+            "name": h["name"],
+            "rarity": h.get("rarity"),
+            "cost": h.get("cost"),
+            "faction": h.get("faction"),
+            "clan": h.get("clan"),
+            "gender": h.get("gender"),
+            "detail_url": h.get("detail_url"),
+            "portrait": h.get("portrait"),
+        }
+        if h.get("stats"):
+            hero_out["stats"] = h["stats"]
+        if h.get("traits"):
+            hero_out["traits"] = h["traits"]
+
+        hero_out["unique_skill"] = h.get("unique_skill")
+        hero_out["teachable_skill"] = h.get("teachable_skill")
+        hero_out["assembly_skill"] = asm_name
+
+        # 兵学: hero stores direction → {major: [names], minor: [names]}
+        # Option definitions go into bingxue_db (dedup by name).
+        if raw_bingxue:
+            hero_out["bingxue"] = {}
+            for direction, groups in raw_bingxue.items():
+                hero_out["bingxue"][direction] = {
+                    "major": [opt["name"] for opt in groups["major"]],
+                    "minor": [opt["name"] for opt in groups["minor"]],
+                }
+                for tier in ("major", "minor"):
+                    for opt in groups[tier]:
+                        name = opt["name"]
+                        if name in bingxue_db:
+                            # Same option name reused; extend source list.
+                            # (Effect-collision detection deferred to integrity check.)
+                            if h["name"] not in bingxue_db[name]["source_heroes"]:
+                                bingxue_db[name]["source_heroes"].append(h["name"])
+                        else:
+                            bingxue_db[name] = {
+                                "name": name,
+                                "direction": direction,
+                                "tier": tier,
+                                "effect": opt["effect"],
+                                "source_heroes": [h["name"]],
+                            }
+
+        hero_list.append(hero_out)
+
+    for path, data in [
+        (heroes_path, hero_list),
+        (skills_path, skills_db),
+        (assembly_path, assembly_db),
+        (bingxue_path, bingxue_db),
+    ]:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+    return hero_list, skills_db, assembly_db, bingxue_db
+
+
+def sync_canonical(hero_list: list[dict], skills_db: dict[str, dict], bingxue_db: dict[str, dict]):
+    """Update canonical files' raw sections with freshly crawled data.
+
+    Preserves existing text/vars/battle/passive sections — only overwrites raw.
+    New entries (not yet in canonical) get a raw-only stub for source review.
+    """
+    # --- Skills ---
+    if SKILLS_CANONICAL.exists():
+        canonical = yaml.safe_load(SKILLS_CANONICAL.read_text("utf-8")) or {}
+    else:
+        canonical = {}
+
+    new_skills = 0
+    for name, crawled in skills_db.items():
+        if name not in canonical:
+            canonical[name] = {}
+            new_skills += 1
+        canonical[name]["raw"] = crawled
+
+    SKILLS_CANONICAL.parent.mkdir(parents=True, exist_ok=True)
+    with open(SKILLS_CANONICAL, "w", encoding="utf-8") as f:
+        yaml.dump(canonical, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    tqdm.write(f"[sync] {len(skills_db)} skills → {SKILLS_CANONICAL} ({new_skills} new)")
+
+    # --- Traits (collected from hero detail pages) ---
+    traits_db: dict[str, dict] = {}
+    for h in hero_list:
+        for t in h.get("traits") or []:
+            name = t.get("name")
+            if not name or name in traits_db:
+                continue
+            traits_db[name] = {
+                "name": name,
+                "description": t.get("description", ""),
+                "source_heroes": [h["name"]],
+            }
+
+    # Append additional source heroes for duplicate traits
+    for h in hero_list:
+        for t in h.get("traits") or []:
+            name = t.get("name")
+            if name and name in traits_db and h["name"] not in traits_db[name]["source_heroes"]:
+                traits_db[name]["source_heroes"].append(h["name"])
+
+    if TRAITS_CANONICAL.exists():
+        canonical_t = yaml.safe_load(TRAITS_CANONICAL.read_text("utf-8")) or {}
+    else:
+        canonical_t = {}
+
+    new_traits = 0
+    for name, crawled in traits_db.items():
+        if name not in canonical_t:
+            canonical_t[name] = {}
+            new_traits += 1
+        canonical_t[name]["raw"] = crawled
+
+    with open(TRAITS_CANONICAL, "w", encoding="utf-8") as f:
+        yaml.dump(canonical_t, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    tqdm.write(f"[sync] {len(traits_db)} traits → {TRAITS_CANONICAL} ({new_traits} new)")
+
+    # --- 兵学 options ---
+    if BINGXUE_CANONICAL.exists():
+        canonical_b = yaml.safe_load(BINGXUE_CANONICAL.read_text("utf-8")) or {}
+    else:
+        canonical_b = {}
+
+    new_bingxue = 0
+    for name, crawled in bingxue_db.items():
+        if name not in canonical_b:
+            canonical_b[name] = {}
+            new_bingxue += 1
+        canonical_b[name]["raw"] = crawled
+
+    with open(BINGXUE_CANONICAL, "w", encoding="utf-8") as f:
+        yaml.dump(canonical_b, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    tqdm.write(f"[sync] {len(bingxue_db)} bingxue options → {BINGXUE_CANONICAL} ({new_bingxue} new)")
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+def _apply_detail(hero: dict, detail: dict):
+    """Merge a detail dict into a hero. Detail fields (stats/traits/skills, plus
+    the intentional skill-name override) win, except _index_fields, which only
+    backfill cost/faction/clan/gender the index page left empty."""
+    index_fields = detail.get("_index_fields", {})
+    hero.update({k: v for k, v in detail.items() if k != "_index_fields"})
+    for key, value in index_fields.items():
+        if not hero.get(key):
+            hero[key] = value
+
+
+def crawl(
+    *,
+    index_urls: list[str] | None = None,
+    do_detail: bool = False,
+    limit: int | None = None,
+    name_filter: str | None = None,
+    refresh_index: bool = False,
+    force: bool = False,
+    timeout: float = DEFAULT_TIMEOUT,
+    heroes_path: str = str(HEROES_CRAWLED),
+    skills_path: str = str(SKILLS_CRAWLED),
+    assembly_path: str = str(ASSEMBLY_CRAWLED),
+    bingxue_path: str = str(BINGXUE_CRAWLED),
+):
+    global _cache_dir
+
+    index_urls = [validate_url(u) for u in (index_urls or DEFAULT_INDEX_URLS)]
+    _cache_dir = CRAWL_CACHE_DIR
+
+    # --- Stage 1: Index (union of all sources, primary first) ---
+    # Primary source failure is fatal; supplementary sources are best-effort.
+    use_cached_index = not force and not refresh_index
+    sources = []
+    for idx, url in enumerate(index_urls):
+        page_heroes = load_index(url) if use_cached_index else None
+        if page_heroes is not None:
+            tqdm.write(f"[index] {len(page_heroes)} heroes from cache: {url}")
+        else:
+            tqdm.write(f"[index] Fetching hero list: {url}")
+            try:
+                soup, _ = fetch_page(url, timeout=timeout)
+                page_heroes = extract_hero_index(soup, url)
+            except Exception as e:
+                if idx == 0:
+                    raise
+                tqdm.write(f"[warn] supplementary source failed: {url} — {e}")
+                continue
+            tqdm.write(f"[index] Found {len(page_heroes)} heroes")
+            if not page_heroes:
+                tqdm.write(f"[warn] 0 heroes from {url} — page format may have changed")
+            else:
+                save_index(url, page_heroes)
+        sources.append(page_heroes)
+
+    heroes = merge_index(sources)
+    if len(index_urls) > 1:
+        tqdm.write(f"[index] Merged {len(heroes)} unique heroes from {len(index_urls)} sources")
+
+    if not heroes:
+        tqdm.write("[error] No heroes found. Page structure may have changed.")
+        sys.exit(1)
+
+    # --- Filter ---
+    targets = heroes
+    if name_filter:
+        targets = [h for h in heroes if name_filter in h.get("name", "")]
+        tqdm.write(f"[filter] Matched {len(targets)} heroes for '{name_filter}'")
+    if limit:
+        targets = targets[:limit]
+
+    for h in targets[:5]:
+        tqdm.write(f"  {h['name']}  cost={h.get('cost')}  faction={h.get('faction')}")
+    if len(targets) > 5:
+        tqdm.write(f"  ... and {len(targets) - 5} more")
+
+    # --- Stage 2: Detail pages ---
+    if do_detail:
+        skipped = 0
+        failed = []
+
+        for hero in tqdm(targets, desc="detail", unit="hero"):
+            url = hero.get("detail_url")
+            if not url:
+                continue
+
+            if not force:
+                cached = load_detail_cache(url)
+                if cached:
+                    _apply_detail(hero, cached)
+                    skipped += 1
+                    continue
+
+            try:
+                detail_soup, detail_html = fetch_page(url, timeout=timeout)
+                detail = extract_hero_detail(detail_soup, detail_html, hero["name"])
+                _apply_detail(hero, detail)
+                save_detail_cache(url, detail)
+            except Exception as e:
+                failed.append((hero["name"], str(e)))
+                tqdm.write(f"  FAILED: {hero['name']} — {e}")
+
+            crawl_delay()
+
+        if skipped:
+            tqdm.write(f"[detail] {skipped} from cache, {len(targets) - skipped} fetched")
+        if failed:
+            tqdm.write(f"[warn] {len(failed)} failed — re-run to retry (cache preserved)")
+
+    # --- Save ---
+    hero_list, skills_db, assembly_db, bingxue_db = save_outputs(
+        heroes, heroes_path, skills_path, assembly_path, bingxue_path
+    )
+    tqdm.write(f"\n[done] {len(hero_list)} heroes → {heroes_path}")
+    tqdm.write(f"[done] {len(skills_db)} skills → {skills_path}")
+    tqdm.write(f"[done] {len(assembly_db)} assembly skills → {assembly_path}")
+    tqdm.write(f"[done] {len(bingxue_db)} bingxue options → {bingxue_path}")
+
+    sync_canonical(hero_list, skills_db, bingxue_db)
+
+    return hero_list, skills_db, assembly_db, bingxue_db
+
+
+def main():
+    p = argparse.ArgumentParser(description="Crawl hero data from game8.jp")
+    p.add_argument(
+        "--url", nargs="+", default=DEFAULT_INDEX_URLS,
+        help="Hero index page URL(s), primary first. Extra pages (e.g. the "
+             "最強武将ランキング) are unioned in, contributing net-new heroes only.",
+    )
+    p.add_argument("--heroes-out", default=str(HEROES_CRAWLED), help="Heroes YAML output path")
+    p.add_argument("--skills-out", default=str(SKILLS_CRAWLED), help="Skills YAML output path")
+    p.add_argument("--assembly-out", default=str(ASSEMBLY_CRAWLED), help="Assembly skills YAML output path")
+    p.add_argument("--bingxue-out", default=str(BINGXUE_CRAWLED), help="Bingxue (兵学) options YAML output path")
+    p.add_argument("--detail", action="store_true", help="Enable stage 2 (crawl detail pages)")
+    p.add_argument("--limit", type=int, help="Max heroes to crawl detail for")
+    p.add_argument("--name", help="Filter heroes by name (substring match)")
+    p.add_argument("--refresh-index", action="store_true", help="Re-fetch index page (keep detail cache)")
+    p.add_argument("--force", action="store_true", help="Ignore all cache")
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Request timeout in seconds")
+    args = p.parse_args()
+
+    crawl(
+        index_urls=args.url,
+        do_detail=args.detail,
+        limit=args.limit,
+        name_filter=args.name,
+        refresh_index=args.refresh_index,
+        force=args.force,
+        timeout=args.timeout,
+        heroes_path=args.heroes_out,
+        skills_path=args.skills_out,
+        assembly_path=args.assembly_out,
+        bingxue_path=args.bingxue_out,
+    )
+
+
+if __name__ == "__main__":
+    main()

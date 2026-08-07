@@ -1,0 +1,16 @@
+{
+  "databaseVersion": "2026.08.07-c3a5110166",
+  "updatedAt": "2026-08-07",
+  "heroCount": 147,
+  "skillCount": 213,
+  "sources": [
+    {
+      "name": "Game8 信長の野望 真戦",
+      "url": "https://game8.jp/nobunaga-shinsen/737773"
+    },
+    {
+      "name": "Shinsei-Lineup cfg snapshot",
+      "url": "https://github.com/davidjaw/Shinsei-Lineup"
+    }
+  ]
+}
