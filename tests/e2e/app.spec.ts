@@ -7,7 +7,6 @@ test('日本語ホームと更新確認が動作する', async ({ page }) => {
   await expect(page.getByText('所持武将から、')).toBeVisible()
   await expect(page.locator('.banner-portraits img')).toHaveCount(3)
   await page.waitForFunction(() => [...document.querySelectorAll<HTMLImageElement>('.banner-portraits img')].every((image) => image.complete))
-  await page.screenshot({ path: 'doc/screenshot.png', fullPage: true })
   await page.getByRole('button', { name: '更新を確認' }).click()
   await expect(page.getByRole('status')).toContainText('最新')
 })
