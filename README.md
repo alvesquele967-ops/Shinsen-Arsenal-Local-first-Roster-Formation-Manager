@@ -1,5 +1,9 @@
 # 真戦武将帳 — Shinsen Arsenal
 
+[![品質検査](https://github.com/alvesquele967-ops/Shinsen-Arsenal-Local-first-Roster-Formation-Manager/actions/workflows/ci.yml/badge.svg)](https://github.com/alvesquele967-ops/Shinsen-Arsenal-Local-first-Roster-Formation-Manager/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/alvesquele967-ops/Shinsen-Arsenal-Local-first-Roster-Formation-Manager?display_name=release&label=release)](https://github.com/alvesquele967-ops/Shinsen-Arsenal-Local-first-Roster-Formation-Manager/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 『信長の野望 真戦』の所持武将、凸数、覚醒、所持戦法、器術、兵器候補、三人編成を、アカウント登録なしで管理できるローカルファースト Web アプリです。
 
 個人データは原則として利用中のブラウザ内にだけ保存されます。ゲーム内で発行した公開共有 URL がある場合は、公式公開スナップショットから所持情報を一括でプレビューし、確認後に取り込めます。共有 URL を利用できない場合も、武将カードを押すだけで手動登録できます。
